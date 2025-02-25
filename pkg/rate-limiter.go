@@ -2,8 +2,8 @@ package pkg
 
 import (
 	"fmt"
+	"net"
 	"net/http"
-	"strings"
 	"time"
 
 	"golang.org/x/time/rate"
@@ -12,80 +12,76 @@ import (
 type (
 	RateLimiter struct {
 		config  RateLimiterConfig
-		clients map[string]*rate.Limiter
+		clients map[string]*RateLimiterClient
 	}
-	RateLimiterValue  rate.Limit
+	RateLimiterClient struct {
+		RequestTime time.Time
+		Limiter     *rate.Limiter
+	}
 	RateLimiterConfig struct {
-		RateLimiterValue
-		Keys map[string]RateLimiterValue
+		ApiKeyHeader string
+		ApiKeys      map[string]int
+		MaxRequests  int
+		LockedTime   time.Duration
 	}
 )
 
 func NewRateLimiter(c RateLimiterConfig) RateLimiter {
 	return RateLimiter{
 		config:  c,
-		clients: make(map[string]*rate.Limiter),
+		clients: make(map[string]*RateLimiterClient),
 	}
 }
 
 func (rl *RateLimiter) Handler(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		begin := time.Now()
 		clientKey, limitValue := rl.getRequestConfig(r)
 
-		var limiter, ok = rl.clients[clientKey]
+		var client, ok = rl.clients[clientKey]
 		if !ok {
-			limiter = rate.NewLimiter(rate.Limit(limitValue), 1)
+			client = &RateLimiterClient{
+				RequestTime: time.Now(),
+				Limiter:     rate.NewLimiter(rate.Limit(limitValue), int(limitValue)),
+			}
+			rl.clients[clientKey] = client
 		}
 
-		rl.clients[clientKey] = limiter
+		isFreeze := time.Since(client.RequestTime) < rl.config.LockedTime
 
-		if !limiter.Allow() {
+		if !client.Limiter.Allow() && isFreeze {
 			w.WriteHeader(http.StatusTooManyRequests)
 			fmt.Fprintf(w, "429 - Too Many Requests")
 			return
 		}
 
+		client.RequestTime = time.Now()
 		next.ServeHTTP(w, r)
-		fmt.Println(time.Since(begin), "|", clientKey, "|", limitValue)
 	})
 }
 
-func (rl *RateLimiter) getRequestConfig(r *http.Request) (string, RateLimiterValue) {
-	dcf := rl.config.RateLimiterValue
-	if token := getToken(r); token != "" {
-		if cf, ok := rl.config.Keys[token]; ok {
-			return token, cf
+func (rl *RateLimiter) getRequestConfig(r *http.Request) (string, rate.Limit) {
+	maxReq := rate.Limit(rl.config.MaxRequests)
+	if token := r.Header.Get(rl.config.ApiKeyHeader); token != "" {
+		// Se houver token, verifica se ele está na lista de tokens
+		if max, ok := rl.config.ApiKeys[token]; ok {
+			return token, rate.Limit(max)
 		}
-		return token, dcf
+		// Se não estiver, usa o valor padrão
+		return token, maxReq
 	}
-	return getIP(r), dcf
-}
-
-func getToken(r *http.Request) string {
-	return r.Header.Get("API_KEY")
+	// Se não houver token, usa o IP
+	return getIP(r), maxReq
 }
 
 func getIP(r *http.Request) string {
-	// Verifica o cabeçalho X-Forwarded-For
-	forwarded := r.Header.Get("X-Forwarded-For")
-	if forwarded != "" {
-		ips := strings.Split(forwarded, ",")
-		return strings.TrimSpace(ips[0]) // Pega o primeiro IP da lista
+	// Obtém o IP diretamente do RemoteAddr
+	ip, _, err := net.SplitHostPort(r.RemoteAddr)
+	if err != nil {
+		return "Erro ao obter IP"
 	}
-
-	// Verifica o cabeçalho X-Real-IP
-	realIP := r.Header.Get("X-Real-IP")
-	if realIP != "" {
-		return realIP
+	// Se estiver rodando localmente, pode ser [::1], então converter para 127.0.0.1
+	if ip == "::1" {
+		ip = "127.0.0.1"
 	}
-
-	// Usa o RemoteAddr como fallback
-	ip := r.RemoteAddr
-	// Remove a porta se estiver presente
-	if strings.Contains(ip, ":") {
-		ip = strings.Split(ip, ":")[0]
-	}
-
 	return ip
 }
